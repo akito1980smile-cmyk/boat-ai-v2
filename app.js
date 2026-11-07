@@ -4,6 +4,7 @@ const $=id=>document.getElementById(id), pad=n=>String(n).padStart(2,'0');
 const jst=new Date(Date.now()+9*3600000).toISOString().slice(0,10);$('date').value=jst;
 venues.forEach((v,i)=>$('venue').add(new Option(`${pad(i+1)} ${v}`,pad(i+1))));$('venue').value='12';for(let r=1;r<=12;r++)$('race').add(new Option(`${r}R`,r));$('race').value='12';
 let entries=[],pred=[],isDemo=false,oddsMap={};
+let conceptRows=[],conceptEnabled=false;
 const sample=[['松井繁',6.99,7.31,42.75,6.77],['村上遼',6.69,5.33,45.38,6.79],['池田浩二',7.72,8,35.66,6.78],['久田敏之',7.88,7.59,33.58,6.84],['山田哲也',6.57,5.25,39.2,6.89],['石本裕武',6.67,6.44,31.06,6.73]].map((a,i)=>({lane:i+1,name:a[0],class:'A1',national:a[1],local:a[2],motor:a[3],exhibition:a[4]}));
 function csvParse(text){let rows=[],row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){let c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++}else quoted=!quoted}else if(c===','&&!quoted){row.push(cell);cell=''}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(cell);if(row.some(x=>x.trim()))rows.push(row);row=[];cell=''}else cell+=c}row.push(cell);if(row.some(x=>x.trim()))rows.push(row);return rows}
 function objects(csv){let rows=csvParse(csv.replace(/^\ufeff/,''));if(!rows.length)return [];let h=rows.shift();return rows.map(r=>Object.fromEntries(h.map((k,i)=>[k.trim(),(r[i]||'').trim()])))}
@@ -14,14 +15,23 @@ function normalize(rows,code,r,date){const matched=rows.filter(o=>matching(o,cod
 let lane=number(val(o,['艇番','枠番','艇番号','枠','boat_no','lane']));if(lane>=1&&lane<=6)byLane.set(lane,{lane,name:val(o,['選手名','氏名','レーサー名','選手氏名','name'])||'未取得',class:val(o,['級別','級','class']),national:number(val(o,['全国勝率','勝率','全国_勝率'])),local:number(val(o,['当地勝率','当地_勝率'])),motor:number(val(o,['モーター2連対率','モーター2連率'])),exhibition:null})}return [...byLane.values()].sort((a,b)=>a.lane-b.lane)}
 async function getCSV(dataset,date){const [y,m,d]=date.split('-');const path=`${dataset}/${y}/${m}/${d}.csv`;const urls=[`data/cache/${path}`,`https://boatracecsv.github.io/data/${path}`];let errors=[];for(const url of urls){try{const response=await fetch(url,{cache:'no-store'});if(!response.ok)throw Error(`HTTP ${response.status}`);const rows=objects(await response.text());if(!rows.length)throw Error('CSVが空です');return {rows,url}}catch(e){errors.push(`${url}: ${e.message}`)}}throw Error(errors.join(' / '))}
 const safe=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function render(){let venue=venues[Number($('venue').value)-1];$('raceTitle').textContent=`${$('date').value} ${venue} ${$('race').value}R 出走表${isDemo?'（サンプル）':''}`;$('entries').innerHTML=entries.map(e=>`<tr><td><span class="lane ${e.lane>1?'lane'+e.lane:''}">${e.lane}</span></td><td>${safe(e.name)}</td><td>${safe(e.class)}</td><td>${fmt(e.national)}</td><td>${fmt(e.local)}</td><td>${fmt(e.motor)}%</td><td>${fmt(e.exhibition)}</td></tr>`).join('');$('dataNote').textContent=isDemo?'2026/11/7 住之江12Rの提供画像から作成した固定サンプル。現在の実データではありません。':'公開CSVから取得。欠損項目は—表示。';compute()}
+function render(){let venue=venues[Number($('venue').value)-1];$('raceTitle').textContent=`${$('date').value} ${venue} ${$('race').value}R 出走表${isDemo?'（サンプル）':''}`;$('entries').innerHTML=entries.map(e=>`<tr><td><span class="lane ${e.lane>1?'lane'+e.lane:''}">${e.lane}</span></td><td>${safe(e.name)}</td><td>${safe(e.class)}</td><td>${fmt(e.national)}</td><td>${fmt(e.local)}</td><td>${fmt(e.motor)}%</td><td>${fmt(e.exhibition)}</td></tr>`).join('');$('dataNote').textContent=isDemo?'2026/11/7 住之江12Rの提供画像から作成した固定サンプル。現在の実データではありません。':'公開CSVから取得。欠損項目は—表示。';applyConcept();compute()}
 function fmt(x){return x==null?'—':Number(x).toFixed(2)}
 // Shared pre-race model: historical simulation uses only race-card fields (no post-race data).
-function probabilitiesFor(racers){
+function probabilitiesFor(racers, useConcept=true){
  if(racers.length!==6)return [];
  const strengths=racers.map(e=>{
   const score=1+(e.national??6.5)*.16+(e.local??6.5)*.08+(e.motor??35)*.008+(e.exhibition==null?0:(6.85-e.exhibition)*1.5);
-  return Math.max(.2,score)*([1.65,1.10,1.03,.94,.77,.62][e.lane-1]);
+  let factor=1;
+  // Experimental heuristic, not calibrated or endorsed by BOATBoy.
+  if(useConcept && conceptEnabled && e.concept){
+   const c=e.concept;
+   if(e.lane===1 && c.win1!=null)factor*=Math.max(.65,Math.min(1.5, .75+c.win1/200));
+   if(e.lane===2 && c.escape2!=null)factor*=Math.max(.8,Math.min(1.2,1.1-c.escape2/500));
+   if(e.lane>=2 && c.makuri!=null)factor*=Math.max(.85,Math.min(1.25,.9+c.makuri/150));
+   if(e.lane>=2 && c.sashi!=null)factor*=Math.max(.85,Math.min(1.25,.9+c.sashi/150));
+  }
+  return Math.max(.2,score)*([1.65,1.10,1.03,.94,.77,.62][e.lane-1])*factor;
  });
  const total=strengths.reduce((a,b)=>a+b,0),out=[];
  for(let a=0;a<6;a++)for(let b=0;b<6;b++)for(let c=0;c<6;c++){
@@ -128,46 +138,91 @@ $('runBacktest').onclick=async()=>{
  finally{$('runBacktest').disabled=false}
 };
 
-// Automatic retrospective simulation: obtains archived race cards and final payout data.
+// Historical reference simulation. No future outcomes are used in probability calculation.
 $('autoVenue').add(new Option('全24場','all'));
 venues.forEach((name,i)=>$('autoVenue').add(new Option(`${pad(i+1)} ${name}`,pad(i+1))));
-$('autoVenue').value='12';
+$('autoVenue').value='all';
 const yesterday=new Date(Date.parse(jst+'T00:00:00Z')-86400000).toISOString().slice(0,10);
 $('autoEnd').value=yesterday;
-$('autoStart').value=new Date(Date.parse(yesterday+'T00:00:00Z')-6*86400000).toISOString().slice(0,10);
+$('autoStart').value=new Date(Date.parse(yesterday+'T00:00:00Z')-89*86400000).toISOString().slice(0,10);
 const raceId=o=>String(val(o,['レースコード','race_code','race_id'])).trim();
 const datesBetween=(start,end)=>{
  const a=Date.parse(start+'T00:00:00Z'),b=Date.parse(end+'T00:00:00Z');
  if(!Number.isFinite(a)||!Number.isFinite(b)||b<a)throw Error('開始日・終了日を確認してください。');
  const count=Math.round((b-a)/86400000)+1;
  if(count>90)throw Error('一度に検証できるのは最大90日間です。');
- if(b>=Date.parse(jst+'T00:00:00Z'))throw Error('結果確定済みの過去日を指定してください（本日以降は対象外）。');
+ if(b>=Date.parse(jst+'T00:00:00Z'))throw Error('結果確定済みの過去日を指定してください。');
  return Array.from({length:count},(_,i)=>new Date(a+i*86400000).toISOString().slice(0,10));
 };
 const uniqueRaceId=id=>/^\d{12}$/.test(id)&&Number(id.slice(8,10))>=1&&Number(id.slice(8,10))<=24&&Number(id.slice(10,12))>=1&&Number(id.slice(10,12))<=12;
-let cancelAutoRequested=false;
-$('cancelAuto').onclick=()=>{cancelAutoRequested=true;$('autoMsg').textContent='中止要求を受け付けました。現在の取得処理が終わり次第停止します。';};
+let cancelAutoRequested=false, autoDetails=[],autoDateCount=0;
+const topOptions=[1,3,5,10];
+const summaryFor=(items,n,stake)=>{
+ const races=items.length,wins=items.filter(d=>d.ranks[n]).length,spent=races*n*stake;
+ const returned=items.reduce((s,d)=>s+(d.ranks[n]?d.payout*stake/100:0),0);
+ const brier=races?items.reduce((s,d)=>s+d.brier,0)/races:null;
+ return {races,wins,spent,returned,hit:races?wins/races*100:null,roi:spent?returned/spent*100:null,brier};
+};
+const pct=n=>n==null?'—':n.toFixed(1)+'%';
+const yen=n=>n.toLocaleString('ja-JP')+'円';
+const periodLabel=p=>p==='train'?'前半60日':p==='test'?'後半30日':'全期間';
+function renderAutoResults(){
+ const stake=Number($('autoStake').value),selectedN=Number($('autoTop').value),all=autoDetails;
+ const sets={all,train:all.filter(d=>d.period==='train'),test:all.filter(d=>d.period==='test')};
+ const overall=summaryFor(all,selectedN,stake);
+ $('autoTested').textContent=String(overall.races);
+ $('autoHit').textContent=pct(overall.hit);
+ $('autoRoi').textContent=pct(overall.roi);
+ $('autoBrier').textContent=overall.brier==null?'—':overall.brier.toFixed(4);
+ $('periodRows').innerHTML=['train','test','all'].map(key=>{
+  const s=summaryFor(sets[key],selectedN,stake);
+  const days=key==='train'?Math.min(autoDateCount,60):key==='test'?Math.max(0,autoDateCount-60):autoDateCount;
+  return `<tr><td>${periodLabel(key)}</td><td>${days}</td><td>${s.races}</td><td>${s.wins}</td><td>${pct(s.hit)}</td><td>${yen(s.spent)}</td><td>${yen(s.returned)}</td><td>${pct(s.roi)}</td><td>${s.brier==null?'—':s.brier.toFixed(4)}</td></tr>`;
+ }).join('');
+ $('topCompareRows').innerHTML=['train','test','all'].flatMap(key=>topOptions.map(n=>{
+  const s=summaryFor(sets[key],n,stake);
+  return `<tr><td>${periodLabel(key)}</td><td>${n}</td><td>${s.races}</td><td>${pct(s.hit)}</td><td>${yen(s.spent)}</td><td>${yen(s.returned)}</td><td>${pct(s.roi)}</td></tr>`;
+ })).join('');
+ const rankItems=sets[$('rankPeriod').value]||all;
+ const stats=new Map();
+ for(const d of rankItems){if(!stats.has(d.code))stats.set(d.code,[]);stats.get(d.code).push(d)}
+ const ranked=[...stats].map(([code,rows])=>({code,...summaryFor(rows,selectedN,stake)}))
+  .sort((a,b)=>(b.roi??-1)-(a.roi??-1)||b.races-a.races);
+ $('venueRankRows').innerHTML=ranked.map((s,i)=>`<tr><td>${i+1}</td><td>${safe(venues[Number(s.code)-1])}</td><td>${s.races}</td><td>${s.wins}</td><td>${pct(s.hit)}</td><td>${yen(s.spent)}</td><td>${yen(s.returned)}</td><td>${pct(s.roi)}</td></tr>`).join('');
+ $('autoRows').innerHTML=all.slice(0,300).map(d=>`<tr><td>${safe(d.id)}</td><td>${safe(d.actual)}</td><td>${d.ranks[selectedN]?'的中':'不的中'}</td><td>${(d.correctP*100).toFixed(2)}%</td><td>${yen(d.payout)}</td><td>${yen(d.ranks[selectedN]?d.payout*stake/100:0)}</td></tr>`).join('');
+}
+$('rankPeriod').onchange=()=>{if(autoDetails.length)renderAutoResults()};
+$('cancelAuto').onclick=()=>{cancelAutoRequested=true;$('autoMsg').textContent='中止要求を受け付けました。現在の取得処理が終わり次第停止します。'};
+$('exportAuto').onclick=()=>{
+ if(!autoDetails.length)return;
+ const n=Number($('autoTop').value),stake=Number($('autoStake').value);
+ const header=['race_id','date','venue_code','venue','period','actual','predicted_probability','top_n','hit','stake_yen','payout_per_100_yen','returned_yen','brier'];
+ const rows=autoDetails.map(d=>[d.id,d.date,d.code,venues[Number(d.code)-1],periodLabel(d.period),d.actual,d.correctP.toFixed(8),n,d.ranks[n]?1:0,n*stake,d.payout,d.ranks[n]?d.payout*stake/100:0,d.brier.toFixed(8)]);
+ const csv='\ufeff'+[header,...rows].map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
+ const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;a.download=`boat-ai-v3.4-backtest-${$('autoStart').value}-${$('autoEnd').value}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
 $('runAuto').onclick=async()=>{
  const button=$('runAuto'),cancel=$('cancelAuto'),msg=$('autoMsg');
  button.disabled=true;cancel.disabled=false;cancelAutoRequested=false;msg.className='muted';
- $('autoRows').innerHTML='';$('venueRankRows').innerHTML='';
+ autoDetails=[];autoDateCount=0;$('exportAuto').disabled=true;
  for(const id of ['autoTested','autoHit','autoRoi','autoBrier'])$(id).textContent='—';
+ for(const id of ['autoRows','venueRankRows','periodRows','topCompareRows'])$(id).innerHTML='';
  try{
   const dates=datesBetween($('autoStart').value,$('autoEnd').value),venue=$('autoVenue').value;
   const topN=Number($('autoTop').value),stake=Number($('autoStake').value);
-  if(!Number.isInteger(topN)||topN<1||topN>120)throw Error('買い目数が不正です。');
+  if(![1,3,5,10,20].includes(topN))throw Error('買い目数が不正です。');
   if(!Number.isInteger(stake)||stake<100||stake%100)throw Error('購入額は100円以上・100円単位にしてください。');
-  let tested=0,wins=0,spent=0,returned=0,brier=0,logloss=0,skipped=0,missing=0,processed=0;
-  const details=[],venueStats=new Map();
-  // Fetch at most three dates concurrently to limit requests and memory use.
-  async function processDate(date){
+  autoDateCount=dates.length;
+  let skipped=0,missing=0,processed=0;
+  async function processDate(date,idx){
    if(cancelAutoRequested)return;
    let cards,payouts;
    try{[cards,payouts]=await Promise.all([getCSV('programs/race_cards',date),getCSV('results/payouts',date)]);}catch(err){missing++;processed++;return;}
    let results=null;
    try{results=(await getCSV('results/realtime',date)).rows;}catch(e){}
    const resultMap=new Map();
-   if(results)for(const row of results){const id=raceId(row);if(uniqueRaceId(id))resultMap.set(id,row);}
+   if(results)for(const row of results){const id=raceId(row);if(uniqueRaceId(id))resultMap.set(id,row)}
    const seen=new Set();
    for(const row of payouts.rows){
     const id=raceId(row);
@@ -176,44 +231,61 @@ $('runAuto').onclick=async()=>{
     const actual=String(val(row,['3連単_組番','３連単_組番','三連単_組番'])).trim();
     const payoutRaw=String(val(row,['3連単_払戻金','３連単_払戻金','三連単_払戻金'])).replace(/[,，円\s]/g,'');
     const payout=Number(payoutRaw);
-    if(!validBet(actual)||!payoutRaw||!Number.isFinite(payout)||payout<=0){skipped++;continue;}
+    if(!validBet(actual)||!payoutRaw||!Number.isFinite(payout)||payout<=0){skipped++;continue}
     const resultRow=resultMap.get(id);
-    if(results&&!resultRow){skipped++;continue;}
-    if(resultRow){const finishing=[1,2,3].map(n=>String(val(resultRow,[`${n}着_艇番`])).trim()).join('-');if(finishing!==actual){skipped++;continue;}}
+    if(results&&!resultRow){skipped++;continue}
+    if(resultRow){const finishing=[1,2,3].map(n=>String(val(resultRow,[`${n}着_艇番`])).trim()).join('-');if(finishing!==actual){skipped++;continue}}
     const code=id.slice(8,10),r=Number(id.slice(10,12));
     const racers=normalize(cards.rows,code,r,date);
-    if(racers.length!==6||racers.some(e=>!e.name||e.name==='未取得')){skipped++;continue;}
+    if(racers.length!==6||racers.some(e=>!e.name||e.name==='未取得')){skipped++;continue}
     const probabilities=probabilitiesFor(racers),correct=probabilities.find(p=>p.bet===actual);
-    if(!correct||probabilities.length!==120){skipped++;continue;}
-    const selected=probabilities.slice(0,topN),hit=selected.some(p=>p.bet===actual),raceSpend=topN*stake,raceReturn=hit?payout*stake/100:0;
-    tested++;if(hit)wins++;spent+=raceSpend;returned+=raceReturn;
-    brier+=probabilities.reduce((sum,p)=>sum+(p.p-(p.bet===actual?1:0))**2,0);
-    logloss+=-Math.log(Math.max(correct.p,1e-15));
-    details.push({id,actual,hit,payout,correctP:correct.p,spent:raceSpend,returned:raceReturn});
-    if(!venueStats.has(code))venueStats.set(code,{code,tested:0,wins:0,spent:0,returned:0});
-    const s=venueStats.get(code);s.tested++;if(hit)s.wins++;s.spent+=raceSpend;s.returned+=raceReturn;
+    if(!correct||probabilities.length!==120){skipped++;continue}
+    const ranks={};for(const n of [...topOptions,20])ranks[n]=probabilities.slice(0,n).some(p=>p.bet===actual);
+    const brier=probabilities.reduce((sum,p)=>sum+(p.p-(p.bet===actual?1:0))**2,0);
+    autoDetails.push({id,date,code,period:idx<60?'train':'test',actual,payout,correctP:correct.p,brier,ranks});
    }
    processed++;
   }
   for(let i=0;i<dates.length;i+=3){
    if(cancelAutoRequested)break;
-   msg.textContent=`過去レース検証中：${processed}/${dates.length}日処理済み、${tested}レース検証済み（中止可能）`;
-   await Promise.all(dates.slice(i,i+3).map(processDate));
-   // Yield to the browser for rendering and cancel-button input.
+   msg.textContent=`過去レース検証中：${processed}/${dates.length}日処理済み、${autoDetails.length}レース検証済み（中止可能）`;
+   await Promise.all(dates.slice(i,i+3).map((date,j)=>processDate(date,i+j)));
    await new Promise(resolve=>setTimeout(resolve,0));
   }
-  if(!tested)throw Error(`検証可能なレースがありません。未取得 ${missing}日、除外 ${skipped}レース。`);
-  $('autoTested').textContent=String(tested);
-  $('autoHit').textContent=(wins/tested*100).toFixed(1)+'%';
-  $('autoRoi').textContent=(returned/spent*100).toFixed(1)+'%';
-  $('autoBrier').textContent=(brier/tested).toFixed(4);
-  const ranked=[...venueStats.values()].sort((a,b)=>b.returned/b.spent-a.returned/a.spent||b.tested-a.tested);
-  $('venueRankRows').innerHTML=ranked.map((s,i)=>`<tr><td>${i+1}</td><td>${safe(venues[Number(s.code)-1])}</td><td>${s.tested}</td><td>${s.wins}</td><td>${(s.wins/s.tested*100).toFixed(1)}%</td><td>${s.spent.toLocaleString()}円</td><td>${s.returned.toLocaleString()}円</td><td>${(s.returned/s.spent*100).toFixed(1)}%</td></tr>`).join('');
-  details.sort((a,b)=>a.id.localeCompare(b.id));
-  // Avoid inserting thousands of table rows at once on mobile devices.
-  $('autoRows').innerHTML=details.slice(0,300).map(d=>`<tr><td>${safe(d.id)}</td><td>${safe(d.actual)}</td><td>${d.hit?'的中':'不的中'}</td><td>${(d.correctP*100).toFixed(2)}%</td><td>${d.payout.toLocaleString()}円</td><td>${d.returned.toLocaleString()}円</td></tr>`).join('');
-  msg.textContent=`${cancelAutoRequested?'中止時点の途中集計':'検証完了'}：${processed}/${dates.length}日、${tested}レース、的中${wins}、投資${spent.toLocaleString()}円、払戻${returned.toLocaleString()}円、未取得${missing}日、除外${skipped}レース。対数損失 ${(logloss/tested).toFixed(4)}。レース詳細は先頭300件まで表示。過去の出走表だけを使った参考シミュレーションで、展示タイム・事前保存予測は使用していません。`;
+  if(!autoDetails.length)throw Error(`検証可能なレースがありません。未取得 ${missing}日、除外 ${skipped}レース。`);
+  autoDetails.sort((a,b)=>a.id.localeCompare(b.id));
+  renderAutoResults();$('exportAuto').disabled=false;
+  const s=summaryFor(autoDetails,topN,stake);
+  msg.textContent=`${cancelAutoRequested?'中止時点の途中集計':'検証完了'}：${processed}/${dates.length}日、${s.races}レース、的中${s.wins}、投資${yen(s.spent)}、払戻${yen(s.returned)}、未取得${missing}日、除外${skipped}レース。期間比較は指定開始日から60日目で分割。過去の出走表だけを使う参考シミュレーションであり、展示タイム・事前保存予測は使用していません。`;
   msg.className='success';
- }catch(err){msg.textContent='自動検証失敗: '+err.message;msg.className='error';}
- finally{button.disabled=false;cancel.disabled=true;}
+ }catch(err){msg.textContent='自動検証失敗: '+err.message;msg.className='error'}
+ finally{button.disabled=false;cancel.disabled=true}
 };
+
+
+// User-provided licensed data only; no scraping, login automation or redistribution.
+function applyConcept(){
+ for(const e of entries){
+  const row=conceptRows.find(x=>x.date===$('date').value && x.venue===pad(Number($('venue').value)) && Number(x.race)===Number($('race').value) && Number(x.lane)===e.lane);
+  e.concept=row||null;
+ }
+ const found=entries.filter(e=>e.concept).length;
+ $('conceptStatus').textContent=conceptRows.length?`読込 ${conceptRows.length}行 / 現在のレースに一致 ${found}/6艇（未一致は従来モデル）`:'未読込：従来モデルで予測';
+}
+$('conceptFile').addEventListener('change',async event=>{
+ try{
+  const file=event.target.files[0];if(!file)return;
+  const rows=objects(await file.text());
+  const required=['date','venue','race','lane'];
+  if(!rows.length||!required.every(k=>Object.hasOwn(rows[0],k)))throw Error('date,venue,race,lane 列が必要です');
+  const numeric=['win1','escape2','makuri','sashi'];
+  conceptRows=rows.map((r,i)=>{
+   const v={date:r.date,venue:pad(Number(r.venue)),race:Number(r.race),lane:Number(r.lane)};
+   if(!/^\d{4}-\d{2}-\d{2}$/.test(v.date)||!Number.isInteger(v.race)||v.race<1||v.race>12||!Number.isInteger(v.lane)||v.lane<1||v.lane>6||!/^\d{2}$/.test(v.venue))throw Error(`${i+2}行目のレース識別子が不正です`);
+   for(const key of numeric){const raw=(r[key]||'').replace('%','').trim();const n=raw===''?null:Number(raw);if(n!==null&&(!Number.isFinite(n)||n<0||n>100))throw Error(`${i+2}行目の${key}は0～100で入力してください`);v[key]=n;}
+   return v;
+  });
+  conceptEnabled=true;$('conceptToggle').checked=true;applyConcept();compute();
+ }catch(err){conceptRows=[];conceptEnabled=false;$('conceptToggle').checked=false;applyConcept();compute();$('conceptStatus').textContent='読込失敗: '+err.message;}
+});
+$('conceptToggle').addEventListener('change',event=>{conceptEnabled=event.target.checked;compute()});
