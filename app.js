@@ -24,7 +24,7 @@ function probabilitiesFor(racers, useConcept=true){
   const score=1+(e.national??6.5)*.16+(e.local??6.5)*.08+(e.motor??35)*.008+(e.exhibition==null?0:(6.85-e.exhibition)*1.5);
   let factor=1;
   // Experimental heuristic, not calibrated or endorsed by BOATBoy.
-  if(useConcept && conceptEnabled && e.concept){
+  if(useConcept && e.concept){
    const c=e.concept;
    if(e.lane===1 && c.win1!=null)factor*=Math.max(.65,Math.min(1.5, .75+c.win1/200));
    if(e.lane===2 && c.escape2!=null)factor*=Math.max(.8,Math.min(1.2,1.1-c.escape2/500));
@@ -46,7 +46,7 @@ function compute(){
  if(entries.length!==6){$('predictions').innerHTML='';$('best').textContent='—';$('bestP').textContent='—';$('betSummary').textContent='';return}
  // Plackett-Luce style sequential ordering: P(a,b,c)=P(a)*P(b|a)*P(c|a,b).
  // Hand-tuned strengths, not fitted to historical outcomes; NOT calibrated probabilities.
- pred=probabilitiesFor(entries).map(item=>{const odd=oddsMap[item.bet]||null;return {...item,odds:odd,ev:odd?item.p*odd:null};});
+ pred=probabilitiesFor(entries,conceptEnabled).map(item=>{const odd=oddsMap[item.bet]||null;return {...item,odds:odd,ev:odd?item.p*odd:null};});
  $('best').textContent=pred[0].bet;$('bestP').textContent=(pred[0].p*100).toFixed(2)+'%';renderBets();
 }
 function selectedBets(){
@@ -238,7 +238,7 @@ $('runAuto').onclick=async()=>{
     const code=id.slice(8,10),r=Number(id.slice(10,12));
     const racers=normalize(cards.rows,code,r,date);
     if(racers.length!==6||racers.some(e=>!e.name||e.name==='未取得')){skipped++;continue}
-    const probabilities=probabilitiesFor(racers),correct=probabilities.find(p=>p.bet===actual);
+    const probabilities=probabilitiesFor(racers,false),correct=probabilities.find(p=>p.bet===actual);
     if(!correct||probabilities.length!==120){skipped++;continue}
     const ranks={};for(const n of [...topOptions,20])ranks[n]=probabilities.slice(0,n).some(p=>p.bet===actual);
     const brier=probabilities.reduce((sum,p)=>sum+(p.p-(p.bet===actual?1:0))**2,0);
@@ -289,3 +289,88 @@ $('conceptFile').addEventListener('change',async event=>{
  }catch(err){conceptRows=[];conceptEnabled=false;$('conceptToggle').checked=false;applyConcept();compute();$('conceptStatus').textContent='読込失敗: '+err.message;}
 });
 $('conceptToggle').addEventListener('change',event=>{conceptEnabled=event.target.checked;compute()});
+
+
+// v3.6: paired comparison uses identical races with complete user-supplied pre-race concept rows.
+// Never backfill missing lanes or use concept rows dated after the race.
+let pairedResults=[];
+const conceptKey=(date,venue,race,lane)=>`${date}|${pad(Number(venue))}|${Number(race)}|${Number(lane)}`;
+function conceptIndex(){const m=new Map();for(const row of conceptRows)m.set(conceptKey(row.date,row.venue,row.race,row.lane),row);return m}
+function pairedSummary(items,model,n,stake){
+ const races=items.length,wins=items.filter(d=>d[model].ranks[n]).length;
+ const spent=races*n*stake,returned=items.reduce((sum,d)=>sum+(d[model].ranks[n]?d.payout*stake/100:0),0);
+ return {races,wins,spent,returned,hit:races?wins/races*100:null,roi:spent?returned/spent*100:null,brier:races?items.reduce((sum,d)=>sum+d[model].brier,0)/races:null};
+}
+function renderPaired(){
+ const n=Number($('pairTop').value),stake=Number($('pairStake').value);
+ $('pairRows').innerHTML=['train','test','all'].flatMap(period=>['off','on'].map(model=>{
+  const rows=pairedResults.filter(d=>period==='all'||d.period===period),s=pairedSummary(rows,model,n,stake);
+  return `<tr><td>${periodLabel(period)}</td><td>${model==='on'?'ON':'OFF'}</td><td>${s.races}</td><td>${s.wins}</td><td>${pct(s.hit)}</td><td>${yen(s.spent)}</td><td>${yen(s.returned)}</td><td>${pct(s.roi)}</td><td>${s.brier==null?'—':s.brier.toFixed(4)}</td></tr>`;
+ })).join('');
+ $('pairDetailRows').innerHTML=pairedResults.slice(0,300).map(d=>`<tr><td>${safe(d.id)}</td><td>${safe(d.actual)}</td><td>${d.off.ranks[n]?'的中':'不的中'}</td><td>${d.on.ranks[n]?'的中':'不的中'}</td><td>${(d.off.correctP*100).toFixed(2)}%</td><td>${(d.on.correctP*100).toFixed(2)}%</td></tr>`).join('');
+ $('pairCount').textContent=String(pairedResults.length);
+}
+$('pairTop').onchange=()=>{if(pairedResults.length)renderPaired()};
+$('pairStake').onchange=()=>{if(pairedResults.length)renderPaired()};
+$('pairExport').onclick=()=>{
+ if(!pairedResults.length)return;
+ const n=Number($('pairTop').value),stake=Number($('pairStake').value);
+ const head=['race_id','period','actual','payout_per_100','off_correct_probability','on_correct_probability','off_brier','on_brier','off_hit','on_hit','off_returned_yen','on_returned_yen'];
+ const rows=pairedResults.map(d=>[d.id,periodLabel(d.period),d.actual,d.payout,d.off.correctP,d.on.correctP,d.off.brier,d.on.brier,Number(d.off.ranks[n]),Number(d.on.ranks[n]),d.off.ranks[n]?d.payout*stake/100:0,d.on.ranks[n]?d.payout*stake/100:0]);
+ const csv='\ufeff'+[head,...rows].map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
+ const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='boat-ai-v3.6-concept-paired.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+$('pairRun').onclick=async()=>{
+ const button=$('pairRun'),msg=$('pairMsg');button.disabled=true;pairedResults=[];$('pairExport').disabled=true;
+ $('pairRows').innerHTML='';$('pairDetailRows').innerHTML='';$('pairCount').textContent='—';
+ try{
+  if(!conceptRows.length)throw Error('先に新概念データCSVを読み込んでください。');
+  const dates=datesBetween($('autoStart').value,$('autoEnd').value),venue=$('autoVenue').value;
+  const n=Number($('pairTop').value),stake=Number($('pairStake').value);
+  if(![1,3,5,10,20].includes(n)||!Number.isInteger(stake)||stake<100||stake%100!==0)throw Error('買い目数・購入額を確認してください。');
+  const index=conceptIndex(),group=new Map();
+  for(const row of conceptRows){const k=conceptKey(row.date,row.venue,row.race,0).split('|').slice(0,3).join('|');if(!group.has(k))group.set(k,new Set());group.get(k).add(row.lane)}
+  const eligible=[];
+  for(let i=0;i<dates.length;i++)for(let code=1;code<=24;code++){
+   if(venue!=='all'&&pad(code)!==venue)continue;
+   for(let r=1;r<=12;r++)if(group.get(`${dates[i]}|${pad(code)}|${r}`)?.size===6)eligible.push({date:dates[i],idx:i,code:pad(code),r});
+  }
+  if(!eligible.length)throw Error('指定期間・場に6艇分揃った新概念データがありません。過去日付のCSVを追加してください。');
+  const grouped=new Map();for(const race of eligible){if(!grouped.has(race.date))grouped.set(race.date,[]);grouped.get(race.date).push(race)}
+  let missing=0,excluded=0,done=0;
+  for(const [date,races] of grouped){
+   msg.textContent=`比較検証中：${done}/${grouped.size}日、${pairedResults.length}レース照合済み`;
+   let cards,payouts,results=null;
+   try{[cards,payouts]=await Promise.all([getCSV('programs/race_cards',date),getCSV('results/payouts',date)]);try{results=(await getCSV('results/realtime',date)).rows}catch(e){}}
+   catch(e){missing++;done++;continue}
+   const payMap=new Map();for(const row of payouts.rows){const id=raceId(row);if(uniqueRaceId(id))payMap.set(id,row)}
+   const resultMap=new Map();if(results)for(const row of results){const id=raceId(row);if(uniqueRaceId(id))resultMap.set(id,row)}
+   for(const race of races){
+    const id=date.replaceAll('-','')+race.code+pad(race.r),row=payMap.get(id);
+    if(!row){excluded++;continue}
+    const actual=String(val(row,['3連単_組番','３連単_組番','三連単_組番'])).trim();
+    const payoutRaw=String(val(row,['3連単_払戻金','３連単_払戻金','三連単_払戻金'])).replace(/[,，円\s]/g,'');const payout=Number(payoutRaw);
+    if(!validBet(actual)||!payoutRaw||!Number.isFinite(payout)||payout<=0){excluded++;continue}
+    if(results){const rr=resultMap.get(id);if(!rr||[1,2,3].map(i=>String(val(rr,[`${i}着_艇番`])).trim()).join('-')!==actual){excluded++;continue}}
+    const racers=normalize(cards.rows,race.code,race.r,date);
+    if(racers.length!==6||racers.some(e=>!e.name||e.name==='未取得')){excluded++;continue}
+    for(const e of racers)e.concept=index.get(conceptKey(date,race.code,race.r,e.lane))||null;
+    if(racers.some(e=>!e.concept)){excluded++;continue}
+    const models={};
+    for(const [key,useConcept] of [['off',false],['on',true]]){
+     const probs=probabilitiesFor(racers,useConcept),correct=probs.find(p=>p.bet===actual);
+     if(probs.length!==120||!correct)break;
+     const ranks={};for(const count of [1,3,5,10,20])ranks[count]=probs.slice(0,count).some(p=>p.bet===actual);
+     models[key]={correctP:correct.p,brier:probs.reduce((sum,p)=>sum+(p.p-(p.bet===actual?1:0))**2,0),ranks};
+    }
+    if(!models.off||!models.on){excluded++;continue}
+    pairedResults.push({id,date,code:race.code,period:race.idx<60?'train':'test',actual,payout,...models});
+   }
+   done++;await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  if(!pairedResults.length)throw Error(`照合できた確定レースは0件です。未取得日${missing}、除外${excluded}。`);
+  pairedResults.sort((a,b)=>a.id.localeCompare(b.id));renderPaired();$('pairExport').disabled=false;
+  msg.textContent=`比較完了：${pairedResults.length}レース（6艇の新概念データが揃い、結果・払戻を照合できたレースのみ）。未取得日${missing}、除外${excluded}。同一レースをON/OFF両方で評価しました。`;
+  msg.className='success';
+ }catch(e){msg.textContent='比較検証：'+e.message;msg.className='error'}finally{button.disabled=false}
+};
