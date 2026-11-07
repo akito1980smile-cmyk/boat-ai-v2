@@ -62,4 +62,65 @@ $('export').onclick=()=>{
 $('load').onclick=async()=>{const date=$('date').value;if(!date)return;const code=$('venue').value,r=Number($('race').value);$('load').disabled=true;$('message').textContent='公開CSVを取得中…';$('status').textContent='取得中';$('message').className='muted';entries=[];isDemo=false;render();try{const card=await getCSV('programs/race_cards',date);const result=normalize(card.rows,code,r,date);if(result.length!==6)throw Error(`該当レースの6艇を確認できません（${result.length}艇）。開催がない、未公開、またはCSV仕様変更の可能性があります。`);let exhibitionStatus='展示情報未取得';try{const preview=await getCSV('previews/tkz',date);const row=preview.rows.find(o=>matching(o,code,r,date));if(row){let found=0;for(const e of result){const raw=val(row,[`艇${e.lane}_展示タイム`,`艇${e.lane}_展示`, `艇${e.lane}_展示航走タイム`]);const n=number(raw);if(n>0){e.exhibition=n;found++}}exhibitionStatus=`展示${found}艇取得`}}catch(e){exhibitionStatus='展示CSV未公開または取得不可'}entries=result;render();$('message').textContent=`実データ取得成功（${card.rows.length}レース中の該当レース） / ${exhibitionStatus} / 取得元: ${card.url}`;$('status').textContent='実データ';$('message').className='success'}catch(err){entries=[];render();$('message').textContent=`実データ取得失敗: ${err.message}。日付・場・Rを確認してください。サンプルは自動表示しません。`;$('status').textContent='取得失敗';$('message').className='error'}finally{$('load').disabled=false}};
 $('demo').onclick=()=>{entries=sample.map(x=>({...x}));isDemo=true;$('date').value='2026-11-07';$('venue').value='12';$('race').value='12';$('message').textContent='提供画像のサンプルを表示中（ライブ取得ではありません）';$('status').textContent='サンプル';$('message').className='muted';render()};
 $('applyOdds').onclick=()=>{oddsMap={};for(const line of $('odds').value.split(/\r?\n/)){const [bet,odd]=line.split(',').map(x=>x.trim());if(/^([1-6]-){2}[1-6]$/.test(bet)&&number(odd)>0)oddsMap[bet]=number(odd)}compute()};for(const id of ['sort','count','budget','strategy'])$(id).onchange=renderBets;
-$('history').onchange=async ev=>{const file=ev.target.files[0];if(!file)return;try{let rows=objects(await file.text());if(!rows.length)throw Error('CSVが空です');let grouped=new Map();for(const row of rows){const id=row.race_id,bet=row.bet,actual=row.actual,stake=number(row.stake),payout=number(row.payout);if(!id||!bet||!actual||stake==null||stake<=0||payout==null)throw Error('必須列または数値が不正です');if(!grouped.has(id))grouped.set(id,[]);grouped.get(id).push({bet,actual,stake,payout})}let wins=0,spent=0,returned=0;for(const bets of grouped.values()){if(bets.some(x=>x.bet===x.actual))wins++;for(const b of bets){spent+=b.stake;if(b.bet===b.actual)returned+=b.payout*b.stake/100}}$('tested').textContent=grouped.size;$('hit').textContent=(wins/grouped.size*100).toFixed(1)+'%';$('roi').textContent=(returned/spent*100).toFixed(1)+'%';$('backtestMsg').textContent=`投資 ${spent.toLocaleString()}円 / 払戻 ${returned.toLocaleString()}円。読み込んだ予測記録に対する集計です。`;}catch(err){$('backtestMsg').textContent='検証失敗: '+err.message}};
+// Historical evaluation uses only archived pre-race prediction probabilities.
+const validBet=bet=>/^[1-6]-[1-6]-[1-6]$/.test(bet)&&new Set(bet.split('-')).size===3;
+const csvRows=async file=>objects(await file.text()).filter(r=>r.race_id!=='race_id');
+$('runBacktest').onclick=async()=>{
+ const predictionFiles=[...$('predictionHistory').files], resultFile=$('resultHistory').files[0];
+ const message=$('backtestMsg');message.className='muted';
+ for(const id of ['tested','hit','roi','logloss','brier','actualP'])$(id).textContent='—';
+ $('backtestRows').innerHTML='';
+ if(!predictionFiles.length||!resultFile){message.textContent='予測CSVと確定結果CSVを両方選択してください。';return}
+ $('runBacktest').disabled=true;
+ try{
+  const predictions=new Map();let ignoredSample=0;
+  for(const file of predictionFiles){
+   for(const row of await csvRows(file)){
+    const id=String(row.race_id||'').trim(),bet=String(row.bet||'').trim(),p=Number(row.estimated_probability);
+    if(String(row.sample||'').toLowerCase()==='yes'){ignoredSample++;continue}
+    if(!/^\d{12}$/.test(id)||!validBet(bet)||row.estimated_probability===''||!Number.isFinite(p)||p<0||p>1)throw Error(`予測CSV「${file.name}」に不正な行があります: ${id} / ${bet}`);
+    if(!predictions.has(id))predictions.set(id,new Map());
+    if(predictions.get(id).has(bet))throw Error(`予測が重複しています: ${id} / ${bet}`);
+    predictions.get(id).set(bet,p);
+   }
+  }
+  const results=new Map();
+  for(const row of await csvRows(resultFile)){
+   const id=String(row.race_id||'').trim(),actual=String(row.actual||'').trim();
+   const hasPayout=String(row.payout??'').trim()!=='';
+   const payout=hasPayout?Number(row.payout):null;
+   if(!/^\d{12}$/.test(id)||!validBet(actual)||(hasPayout&&(!Number.isFinite(payout)||payout<0)))throw Error(`結果CSVに不正な行があります: ${id} / ${actual}`);
+   if(results.has(id))throw Error(`結果CSVでレースIDが重複: ${id}`);
+   results.set(id,{actual,payout});
+  }
+  const topN=Number($('backtestTop').value),stake=Number($('backtestStake').value);
+  if(!Number.isInteger(stake)||stake<100||stake%100!==0)throw Error('購入額は100円以上・100円単位で指定してください。');
+  let evaluated=0,wins=0,spent=0,returned=0,priced=0,ll=0,bs=0,actualPSum=0,invalid=0,unmatched=0;
+  const details=[];
+  for(const [id,betMap] of predictions){
+   const result=results.get(id);
+   if(!result){unmatched++;continue}
+   const values=[...betMap.values()],total=values.reduce((a,b)=>a+b,0);
+   if(betMap.size!==120||Math.abs(total-1)>0.001||!betMap.has(result.actual)){invalid++;continue}
+   const ranked=[...betMap].sort((a,b)=>b[1]-a[1]).slice(0,topN);
+   const hit=ranked.some(([bet])=>bet===result.actual),correctP=betMap.get(result.actual);
+   const raceSpend=topN*stake,raceReturn=result.payout==null?null:(hit?result.payout*stake/100:0);
+   evaluated++;if(hit)wins++;actualPSum+=correctP;
+   ll+=-Math.log(Math.max(correctP,1e-15));
+   bs+=([...betMap].reduce((sum,[bet,p])=>sum+(p-(bet===result.actual?1:0))**2,0));
+   if(raceReturn!=null){spent+=raceSpend;returned+=raceReturn;priced++}
+   details.push({id,actual:result.actual,hit,correctP,raceSpend,raceReturn});
+  }
+  if(!evaluated)throw Error(`照合可能な120通りの予測がありません（結果未照合 ${unmatched}レース、不完全な予測 ${invalid}レース）。`);
+  $('tested').textContent=String(evaluated);
+  $('hit').textContent=(wins/evaluated*100).toFixed(1)+'%';
+  $('roi').textContent=priced? (returned/spent*100).toFixed(1)+'%':'—';
+  $('logloss').textContent=(ll/evaluated).toFixed(4);
+  $('brier').textContent=(bs/evaluated).toFixed(4);
+  $('actualP').textContent=(actualPSum/evaluated*100).toFixed(2)+'%';
+  $('backtestRows').innerHTML=details.map(d=>`<tr><td>${safe(d.id)}</td><td>${safe(d.actual)}</td><td>${d.hit?'的中':'不的中'}</td><td>${(d.correctP*100).toFixed(2)}%</td><td>${d.raceSpend.toLocaleString()}円</td><td>${d.raceReturn==null?'—':d.raceReturn.toLocaleString()+'円'}</td></tr>`).join('');
+  message.textContent=`照合 ${evaluated}レース、的中 ${wins}レース。結果未照合 ${unmatched}レース、不完全な予測 ${invalid}レース、サンプル行除外 ${ignoredSample}行。回収率は払戻がある ${priced}レースのみ（投資 ${spent.toLocaleString()}円 / 払戻 ${returned.toLocaleString()}円）。予測の事前保存時刻はCSVだけでは検証できません。`;
+  message.className='success';
+ }catch(err){message.textContent='検証失敗: '+err.message;message.className='error'}
+ finally{$('runBacktest').disabled=false}
+};
