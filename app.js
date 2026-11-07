@@ -272,22 +272,61 @@ function applyConcept(){
  const found=entries.filter(e=>e.concept).length;
  $('conceptStatus').textContent=conceptRows.length?`読込 ${conceptRows.length}行 / 現在のレースに一致 ${found}/6艇（未一致は従来モデル）`:'未読込：従来モデルで予測';
 }
+// v3.7: Atomic multi-file import, incremental merging and duplicate reporting.
+const conceptKey37=(r)=>`${r.date}|${r.venue}|${r.race}|${r.lane}`;
+function updateConceptInventory(){
+ const groups=new Map();
+ for(const r of conceptRows){const k=`${r.date}|${r.venue}|${r.race}`;if(!groups.has(k))groups.set(k,new Set());groups.get(k).add(r.lane)}
+ const complete=[...groups.values()].filter(x=>x.size===6).length;
+ $('conceptRowCount').textContent=String(conceptRows.length);
+ $('conceptRaceCount').textContent=String(groups.size);
+ $('conceptFullCount').textContent=String(complete);
+ $('conceptPartialCount').textContent=String(groups.size-complete);
+ $('conceptExport').disabled=!conceptRows.length;
+}
+function parseConcept37(r,file,line){
+ const v={date:String(r.date||'').trim(),venue:pad(Number(r.venue)),race:Number(r.race),lane:Number(r.lane)};
+ const [y,m,d]=v.date.split('-').map(Number),dt=new Date(Date.UTC(y,m-1,d));
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(v.date)||dt.getUTCFullYear()!==y||dt.getUTCMonth()!==m-1||dt.getUTCDate()!==d||!Number.isInteger(Number(r.venue))||Number(r.venue)<1||Number(r.venue)>24||!Number.isInteger(v.race)||v.race<1||v.race>12||!Number.isInteger(v.lane)||v.lane<1||v.lane>6)throw Error(`${file} ${line}行目：日付・場(1～24)・R(1～12)・艇番(1～6)を確認してください`);
+ for(const key of ['win1','escape2','makuri','sashi']){
+  const raw=String(r[key]??'').replace('%','').trim(),n=raw===''?null:Number(raw);
+  if(n!==null&&(!Number.isFinite(n)||n<0||n>100))throw Error(`${file} ${line}行目：${key}は0～100で入力してください`);
+  v[key]=n;
+ }
+ return v;
+}
 $('conceptFile').addEventListener('change',async event=>{
+ const files=[...event.target.files];if(!files.length)return;
  try{
-  const file=event.target.files[0];if(!file)return;
-  const rows=objects(await file.text());
-  const required=['date','venue','race','lane'];
-  if(!rows.length||!required.every(k=>Object.hasOwn(rows[0],k)))throw Error('date,venue,race,lane 列が必要です');
-  const numeric=['win1','escape2','makuri','sashi'];
-  conceptRows=rows.map((r,i)=>{
-   const v={date:r.date,venue:pad(Number(r.venue)),race:Number(r.race),lane:Number(r.lane)};
-   if(!/^\d{4}-\d{2}-\d{2}$/.test(v.date)||!Number.isInteger(v.race)||v.race<1||v.race>12||!Number.isInteger(v.lane)||v.lane<1||v.lane>6||!/^\d{2}$/.test(v.venue))throw Error(`${i+2}行目のレース識別子が不正です`);
-   for(const key of numeric){const raw=(r[key]||'').replace('%','').trim();const n=raw===''?null:Number(raw);if(n!==null&&(!Number.isFinite(n)||n<0||n>100))throw Error(`${i+2}行目の${key}は0～100で入力してください`);v[key]=n;}
-   return v;
-  });
-  conceptEnabled=true;$('conceptToggle').checked=true;applyConcept();compute();
- }catch(err){conceptRows=[];conceptEnabled=false;$('conceptToggle').checked=false;applyConcept();compute();$('conceptStatus').textContent='読込失敗: '+err.message;}
+  const incoming=[];
+  for(const file of files){
+   const rows=objects((await file.text()).replace(/^\uFEFF/,''));
+   if(!rows.length||!['date','venue','race','lane'].every(k=>Object.hasOwn(rows[0],k)))throw Error(`${file.name}：date,venue,race,lane 列とデータ行が必要です`);
+   rows.forEach((r,i)=>incoming.push(parseConcept37(r,file.name,i+2)));
+  }
+  const merged=new Map(conceptRows.map(r=>[conceptKey37(r),r]));let duplicates=0;
+  for(const r of incoming){const k=conceptKey37(r);if(merged.has(k))duplicates++;merged.set(k,r)}
+  conceptRows=[...merged.values()].sort((a,b)=>conceptKey37(a).localeCompare(conceptKey37(b)));
+  conceptEnabled=true;$('conceptToggle').checked=true;
+  updateConceptInventory();applyConcept();compute();
+  $('conceptImportStatus').textContent=`追加 ${files.length}ファイル・${incoming.length}行 / 重複 ${duplicates}行（後読み優先）/ 統合 ${conceptRows.length}行。既存登録分も保持しました。`;
+  $('conceptImportStatus').className=duplicates?'muted':'success';
+ }catch(err){$('conceptImportStatus').textContent='読み込み失敗（既存データは保持）：'+err.message;$('conceptImportStatus').className='error'}
+ finally{event.target.value=''}
 });
+$('conceptClear').addEventListener('click',()=>{
+ if(!confirm('登録した新概念データをすべてクリアしますか？'))return;
+ conceptRows=[];conceptEnabled=false;$('conceptToggle').checked=false;
+ updateConceptInventory();applyConcept();compute();
+ $('conceptImportStatus').textContent='登録データをクリアしました。';$('conceptImportStatus').className='muted';
+});
+$('conceptExport').addEventListener('click',()=>{
+ const cols=['date','venue','race','lane','win1','escape2','makuri','sashi'];
+ const csv='\uFEFF'+[cols.join(','),...conceptRows.map(r=>cols.map(k=>r[k]??'').join(','))].join('\r\n');
+ const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;a.download='boat-ai-v3.7-concept-merged.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
+updateConceptInventory();
 $('conceptToggle').addEventListener('change',event=>{conceptEnabled=event.target.checked;compute()});
 
 
