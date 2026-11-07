@@ -140,62 +140,80 @@ const datesBetween=(start,end)=>{
  const a=Date.parse(start+'T00:00:00Z'),b=Date.parse(end+'T00:00:00Z');
  if(!Number.isFinite(a)||!Number.isFinite(b)||b<a)throw Error('開始日・終了日を確認してください。');
  const count=Math.round((b-a)/86400000)+1;
- if(count>14)throw Error('一度に検証できるのは最大14日間です。');
+ if(count>90)throw Error('一度に検証できるのは最大90日間です。');
  if(b>=Date.parse(jst+'T00:00:00Z'))throw Error('結果確定済みの過去日を指定してください（本日以降は対象外）。');
  return Array.from({length:count},(_,i)=>new Date(a+i*86400000).toISOString().slice(0,10));
 };
 const uniqueRaceId=id=>/^\d{12}$/.test(id)&&Number(id.slice(8,10))>=1&&Number(id.slice(8,10))<=24&&Number(id.slice(10,12))>=1&&Number(id.slice(10,12))<=12;
+let cancelAutoRequested=false;
+$('cancelAuto').onclick=()=>{cancelAutoRequested=true;$('autoMsg').textContent='中止要求を受け付けました。現在の取得処理が終わり次第停止します。';};
 $('runAuto').onclick=async()=>{
- const button=$('runAuto'),msg=$('autoMsg');button.disabled=true;msg.className='muted';
- $('autoRows').innerHTML='';for(const id of ['autoTested','autoHit','autoRoi','autoBrier'])$(id).textContent='—';
+ const button=$('runAuto'),cancel=$('cancelAuto'),msg=$('autoMsg');
+ button.disabled=true;cancel.disabled=false;cancelAutoRequested=false;msg.className='muted';
+ $('autoRows').innerHTML='';$('venueRankRows').innerHTML='';
+ for(const id of ['autoTested','autoHit','autoRoi','autoBrier'])$(id).textContent='—';
  try{
   const dates=datesBetween($('autoStart').value,$('autoEnd').value),venue=$('autoVenue').value;
   const topN=Number($('autoTop').value),stake=Number($('autoStake').value);
+  if(!Number.isInteger(topN)||topN<1||topN>120)throw Error('買い目数が不正です。');
   if(!Number.isInteger(stake)||stake<100||stake%100)throw Error('購入額は100円以上・100円単位にしてください。');
-  let tested=0,wins=0,spent=0,returned=0,brier=0,logloss=0,skipped=0,missing=0;
-  const details=[];
-  for(let i=0;i<dates.length;i++){
-   const date=dates[i];msg.textContent=`${i+1}/${dates.length}日目 ${date} の出走表・払戻を取得中…`;
+  let tested=0,wins=0,spent=0,returned=0,brier=0,logloss=0,skipped=0,missing=0,processed=0;
+  const details=[],venueStats=new Map();
+  // Fetch at most three dates concurrently to limit requests and memory use.
+  async function processDate(date){
+   if(cancelAutoRequested)return;
    let cards,payouts;
-   try{[cards,payouts]=await Promise.all([getCSV('programs/race_cards',date),getCSV('results/payouts',date)]);}catch(err){missing++;continue}
-   // Results are optional as payout CSV itself contains the confirmed winning combination.
+   try{[cards,payouts]=await Promise.all([getCSV('programs/race_cards',date),getCSV('results/payouts',date)]);}catch(err){missing++;processed++;return;}
    let results=null;
    try{results=(await getCSV('results/realtime',date)).rows;}catch(e){}
    const resultMap=new Map();
-   if(results)for(const row of results){const id=raceId(row);if(uniqueRaceId(id))resultMap.set(id,row)}
+   if(results)for(const row of results){const id=raceId(row);if(uniqueRaceId(id))resultMap.set(id,row);}
    const seen=new Set();
    for(const row of payouts.rows){
-    const id=raceId(row);if(!uniqueRaceId(id)||id.slice(0,8)!==date.replaceAll('-','')||(venue!=='all'&&id.slice(8,10)!==venue)||seen.has(id))continue;
+    const id=raceId(row);
+    if(!uniqueRaceId(id)||id.slice(0,8)!==date.replaceAll('-','')||(venue!=='all'&&id.slice(8,10)!==venue)||seen.has(id))continue;
     seen.add(id);
     const actual=String(val(row,['3連単_組番','３連単_組番','三連単_組番'])).trim();
     const payoutRaw=String(val(row,['3連単_払戻金','３連単_払戻金','三連単_払戻金'])).replace(/[,，円\s]/g,'');
     const payout=Number(payoutRaw);
-    if(!validBet(actual)||!payoutRaw||!Number.isFinite(payout)||payout<=0){skipped++;continue}
+    if(!validBet(actual)||!payoutRaw||!Number.isFinite(payout)||payout<=0){skipped++;continue;}
     const resultRow=resultMap.get(id);
-    if(results&& !resultRow){skipped++;continue}
-    if(resultRow){
-     const finishing=[1,2,3].map(n=>String(val(resultRow,[`${n}着_艇番`])).trim()).join('-');
-     if(finishing!==actual){skipped++;continue}
-    }
+    if(results&&!resultRow){skipped++;continue;}
+    if(resultRow){const finishing=[1,2,3].map(n=>String(val(resultRow,[`${n}着_艇番`])).trim()).join('-');if(finishing!==actual){skipped++;continue;}}
     const code=id.slice(8,10),r=Number(id.slice(10,12));
     const racers=normalize(cards.rows,code,r,date);
-    if(racers.length!==6||racers.some(e=>!e.name||e.name==='未取得')){skipped++;continue}
+    if(racers.length!==6||racers.some(e=>!e.name||e.name==='未取得')){skipped++;continue;}
     const probabilities=probabilitiesFor(racers),correct=probabilities.find(p=>p.bet===actual);
-    if(!correct||probabilities.length!==120){skipped++;continue}
-    const selected=probabilities.slice(0,topN),hit=selected.some(p=>p.bet===actual);
-    tested++;if(hit)wins++;spent+=topN*stake;returned+=hit?payout*stake/100:0;
+    if(!correct||probabilities.length!==120){skipped++;continue;}
+    const selected=probabilities.slice(0,topN),hit=selected.some(p=>p.bet===actual),raceSpend=topN*stake,raceReturn=hit?payout*stake/100:0;
+    tested++;if(hit)wins++;spent+=raceSpend;returned+=raceReturn;
     brier+=probabilities.reduce((sum,p)=>sum+(p.p-(p.bet===actual?1:0))**2,0);
     logloss+=-Math.log(Math.max(correct.p,1e-15));
-    details.push({id,actual,hit,payout,correctP:correct.p,spent:topN*stake,returned:hit?payout*stake/100:0});
+    details.push({id,actual,hit,payout,correctP:correct.p,spent:raceSpend,returned:raceReturn});
+    if(!venueStats.has(code))venueStats.set(code,{code,tested:0,wins:0,spent:0,returned:0});
+    const s=venueStats.get(code);s.tested++;if(hit)s.wins++;s.spent+=raceSpend;s.returned+=raceReturn;
    }
+   processed++;
   }
-  if(!tested)throw Error(`検証可能なレースがありません。取得できなかった日 ${missing}日、除外 ${skipped}レース。日付やCSV公開状況を確認してください。`);
+  for(let i=0;i<dates.length;i+=3){
+   if(cancelAutoRequested)break;
+   msg.textContent=`過去レース検証中：${processed}/${dates.length}日処理済み、${tested}レース検証済み（中止可能）`;
+   await Promise.all(dates.slice(i,i+3).map(processDate));
+   // Yield to the browser for rendering and cancel-button input.
+   await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  if(!tested)throw Error(`検証可能なレースがありません。未取得 ${missing}日、除外 ${skipped}レース。`);
   $('autoTested').textContent=String(tested);
   $('autoHit').textContent=(wins/tested*100).toFixed(1)+'%';
   $('autoRoi').textContent=(returned/spent*100).toFixed(1)+'%';
   $('autoBrier').textContent=(brier/tested).toFixed(4);
-  $('autoRows').innerHTML=details.map(d=>`<tr><td>${safe(d.id)}</td><td>${safe(d.actual)}</td><td>${d.hit?'的中':'不的中'}</td><td>${(d.correctP*100).toFixed(2)}%</td><td>${d.payout.toLocaleString()}円</td><td>${d.returned.toLocaleString()}円</td></tr>`).join('');
-  msg.textContent=`過去出走表だけで再計算した参考シミュレーション：${tested}レース、的中${wins}、投資${spent.toLocaleString()}円、払戻${returned.toLocaleString()}円。未取得日${missing}、除外${skipped}。対数損失 ${(logloss/tested).toFixed(4)}。展示タイムは使わず、実際に事前保存した予測の検証とは異なります。`;
+  const ranked=[...venueStats.values()].sort((a,b)=>b.returned/b.spent-a.returned/a.spent||b.tested-a.tested);
+  $('venueRankRows').innerHTML=ranked.map((s,i)=>`<tr><td>${i+1}</td><td>${safe(venues[Number(s.code)-1])}</td><td>${s.tested}</td><td>${s.wins}</td><td>${(s.wins/s.tested*100).toFixed(1)}%</td><td>${s.spent.toLocaleString()}円</td><td>${s.returned.toLocaleString()}円</td><td>${(s.returned/s.spent*100).toFixed(1)}%</td></tr>`).join('');
+  details.sort((a,b)=>a.id.localeCompare(b.id));
+  // Avoid inserting thousands of table rows at once on mobile devices.
+  $('autoRows').innerHTML=details.slice(0,300).map(d=>`<tr><td>${safe(d.id)}</td><td>${safe(d.actual)}</td><td>${d.hit?'的中':'不的中'}</td><td>${(d.correctP*100).toFixed(2)}%</td><td>${d.payout.toLocaleString()}円</td><td>${d.returned.toLocaleString()}円</td></tr>`).join('');
+  msg.textContent=`${cancelAutoRequested?'中止時点の途中集計':'検証完了'}：${processed}/${dates.length}日、${tested}レース、的中${wins}、投資${spent.toLocaleString()}円、払戻${returned.toLocaleString()}円、未取得${missing}日、除外${skipped}レース。対数損失 ${(logloss/tested).toFixed(4)}。レース詳細は先頭300件まで表示。過去の出走表だけを使った参考シミュレーションで、展示タイム・事前保存予測は使用していません。`;
   msg.className='success';
- }catch(err){msg.textContent='自動検証失敗: '+err.message;msg.className='error'}finally{button.disabled=false}
+ }catch(err){msg.textContent='自動検証失敗: '+err.message;msg.className='error';}
+ finally{button.disabled=false;cancel.disabled=true;}
 };
