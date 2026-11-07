@@ -16,9 +16,50 @@ async function getCSV(dataset,date){const [y,m,d]=date.split('-');const path=`${
 const safe=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function render(){let venue=venues[Number($('venue').value)-1];$('raceTitle').textContent=`${$('date').value} ${venue} ${$('race').value}R 出走表${isDemo?'（サンプル）':''}`;$('entries').innerHTML=entries.map(e=>`<tr><td><span class="lane ${e.lane>1?'lane'+e.lane:''}">${e.lane}</span></td><td>${safe(e.name)}</td><td>${safe(e.class)}</td><td>${fmt(e.national)}</td><td>${fmt(e.local)}</td><td>${fmt(e.motor)}%</td><td>${fmt(e.exhibition)}</td></tr>`).join('');$('dataNote').textContent=isDemo?'2026/11/7 住之江12Rの提供画像から作成した固定サンプル。現在の実データではありません。':'公開CSVから取得。欠損項目は—表示。';compute()}
 function fmt(x){return x==null?'—':Number(x).toFixed(2)}
-function compute(){pred=[];if(entries.length!==6){$('predictions').innerHTML='';$('best').textContent='—';$('bestP').textContent='—';return}const strengths=entries.map(e=>{let score=1.0+(e.national??6.5)*.16+(e.local??6.5)*.08+(e.motor??35)*.008+(e.exhibition==null?0:(6.85-e.exhibition)*1.5);return Math.max(.2,score)*(e.lane===1?1.65:e.lane===2?1.10:e.lane===3?1.03:e.lane===4?.94:e.lane===5?.77:.62)});let sum=0;for(let a=0;a<6;a++)for(let b=0;b<6;b++)for(let c=0;c<6;c++){if(a===b||a===c||b===c)continue;let weight=strengths[a]*strengths[b]*strengths[c]*(.65+strengths[a]/4)*(.8+strengths[b]/8);const bet=`${a+1}-${b+1}-${c+1}`;pred.push({bet,weight});sum+=weight}pred.forEach(p=>{p.p=p.weight/sum;p.odds=oddsMap[p.bet]||null;p.ev=p.odds?p.p*p.odds:null});pred.sort((a,b)=>b.p-a.p);$('best').textContent=pred[0].bet;$('bestP').textContent=(pred[0].p*100).toFixed(2)+'%';renderBets()}
-function renderBets(){let sorted=[...pred];if($('sort').value==='ev')sorted.sort((a,b)=>(b.ev??-1)-(a.ev??-1));let n=Number($('count').value),budget=Math.max(0,Number($('budget').value)||0);$('predictions').innerHTML=sorted.slice(0,n).map((p,i)=>`<tr><td><b>${p.bet}</b></td><td>${(p.p*100).toFixed(2)}%</td><td>${p.odds??'—'}</td><td>${p.ev==null?'—':p.ev.toFixed(3)+'倍'}</td><td>${Math.floor(budget/n/100)*100}円</td></tr>`).join('')}
+function compute(){
+ pred=[];
+ if(entries.length!==6){$('predictions').innerHTML='';$('best').textContent='—';$('bestP').textContent='—';$('betSummary').textContent='';return}
+ // Plackett-Luce style sequential ordering: P(a,b,c)=P(a)*P(b|a)*P(c|a,b).
+ // Hand-tuned strengths, not fitted to historical outcomes; NOT calibrated probabilities.
+ const strengths=entries.map(e=>{
+  let score=1+(e.national??6.5)*.16+(e.local??6.5)*.08+(e.motor??35)*.008+(e.exhibition==null?0:(6.85-e.exhibition)*1.5);
+  return Math.max(.2,score)*([1.65,1.10,1.03,.94,.77,.62][e.lane-1]);
+ });
+ const total=strengths.reduce((a,b)=>a+b,0);
+ for(let a=0;a<6;a++)for(let b=0;b<6;b++)for(let c=0;c<6;c++){
+  if(a===b||a===c||b===c)continue;
+  const p=strengths[a]/total*strengths[b]/(total-strengths[a])*strengths[c]/(total-strengths[a]-strengths[b]);
+  const bet=`${a+1}-${b+1}-${c+1}`;
+  const odd=oddsMap[bet]||null;
+  pred.push({bet,p,odds:odd,ev:odd?p*odd:null});
+ }
+ pred.sort((a,b)=>b.p-a.p);
+ $('best').textContent=pred[0].bet;$('bestP').textContent=(pred[0].p*100).toFixed(2)+'%';renderBets();
+}
+function selectedBets(){
+ const strategy=$('strategy').value;
+ let sorted=[...pred];
+ if(strategy==='ev')sorted=sorted.filter(p=>p.ev!=null&&p.ev>1).sort((a,b)=>b.ev-a.ev);
+ else if($('sort').value==='ev')sorted.sort((a,b)=>(b.ev??-1)-(a.ev??-1));
+ return sorted.slice(0,Number($('count').value));
+}
+function renderBets(){
+ const selected=selectedBets();
+ const budget=Math.max(0,Math.floor((Number($('budget').value)||0)/100)*100);
+ const units=Math.floor(budget/100);
+ const allocations=selected.map((p,i)=>i<Math.min(units,selected.length)?100:0);
+ let remaining=units-Math.min(units,selected.length),cursor=0;
+ while(remaining>0&&selected.length){allocations[cursor%selected.length]+=100;remaining--;cursor++}
+ $('predictions').innerHTML=selected.map((p,i)=>`<tr><td><b>${p.bet}</b></td><td>${(p.p*100).toFixed(2)}%</td><td>${p.odds??'—'}</td><td>${p.ev==null?'—':p.ev.toFixed(3)+'倍'}</td><td>${allocations[i]}円</td></tr>`).join('');
+ const spent=allocations.reduce((a,b)=>a+b,0);
+ $('betSummary').textContent=`${selected.length}点 / 配分 ${spent.toLocaleString()}円（設定予算 ${budget.toLocaleString()}円） / 確率合計 ${(pred.reduce((a,b)=>a+b.p,0)*100).toFixed(6)}%。期待値は推定確率×オッズであり利益を保証しません。`;
+}
+$('export').onclick=()=>{
+ if(!pred.length){$('message').textContent='先に出走表を取得してください';return}
+ const rows=[['race_id','bet','estimated_probability','odds','expected_return_multiple','sample'],...pred.map(p=>[`${$('date').value.replaceAll('-','')}${$('venue').value}${pad($('race').value)}`,p.bet,p.p.toFixed(8),p.odds??'',p.ev?.toFixed(6)??'',isDemo?'yes':'no'])];
+ const csv='\ufeff'+rows.map(r=>r.join(',')).join('\r\n');const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`boat-ai-v3-${$('date').value}-${$('venue').value}-${$('race').value}R.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
 $('load').onclick=async()=>{const date=$('date').value;if(!date)return;const code=$('venue').value,r=Number($('race').value);$('load').disabled=true;$('message').textContent='公開CSVを取得中…';$('status').textContent='取得中';$('message').className='muted';entries=[];isDemo=false;render();try{const card=await getCSV('programs/race_cards',date);const result=normalize(card.rows,code,r,date);if(result.length!==6)throw Error(`該当レースの6艇を確認できません（${result.length}艇）。開催がない、未公開、またはCSV仕様変更の可能性があります。`);let exhibitionStatus='展示情報未取得';try{const preview=await getCSV('previews/tkz',date);const row=preview.rows.find(o=>matching(o,code,r,date));if(row){let found=0;for(const e of result){const raw=val(row,[`艇${e.lane}_展示タイム`,`艇${e.lane}_展示`, `艇${e.lane}_展示航走タイム`]);const n=number(raw);if(n>0){e.exhibition=n;found++}}exhibitionStatus=`展示${found}艇取得`}}catch(e){exhibitionStatus='展示CSV未公開または取得不可'}entries=result;render();$('message').textContent=`実データ取得成功（${card.rows.length}レース中の該当レース） / ${exhibitionStatus} / 取得元: ${card.url}`;$('status').textContent='実データ';$('message').className='success'}catch(err){entries=[];render();$('message').textContent=`実データ取得失敗: ${err.message}。日付・場・Rを確認してください。サンプルは自動表示しません。`;$('status').textContent='取得失敗';$('message').className='error'}finally{$('load').disabled=false}};
 $('demo').onclick=()=>{entries=sample.map(x=>({...x}));isDemo=true;$('date').value='2026-11-07';$('venue').value='12';$('race').value='12';$('message').textContent='提供画像のサンプルを表示中（ライブ取得ではありません）';$('status').textContent='サンプル';$('message').className='muted';render()};
-$('applyOdds').onclick=()=>{oddsMap={};for(const line of $('odds').value.split(/\r?\n/)){const [bet,odd]=line.split(',').map(x=>x.trim());if(/^([1-6]-){2}[1-6]$/.test(bet)&&number(odd)>0)oddsMap[bet]=number(odd)}compute()};for(const id of ['sort','count','budget'])$(id).onchange=renderBets;
+$('applyOdds').onclick=()=>{oddsMap={};for(const line of $('odds').value.split(/\r?\n/)){const [bet,odd]=line.split(',').map(x=>x.trim());if(/^([1-6]-){2}[1-6]$/.test(bet)&&number(odd)>0)oddsMap[bet]=number(odd)}compute()};for(const id of ['sort','count','budget','strategy'])$(id).onchange=renderBets;
 $('history').onchange=async ev=>{const file=ev.target.files[0];if(!file)return;try{let rows=objects(await file.text());if(!rows.length)throw Error('CSVが空です');let grouped=new Map();for(const row of rows){const id=row.race_id,bet=row.bet,actual=row.actual,stake=number(row.stake),payout=number(row.payout);if(!id||!bet||!actual||stake==null||stake<=0||payout==null)throw Error('必須列または数値が不正です');if(!grouped.has(id))grouped.set(id,[]);grouped.get(id).push({bet,actual,stake,payout})}let wins=0,spent=0,returned=0;for(const bets of grouped.values()){if(bets.some(x=>x.bet===x.actual))wins++;for(const b of bets){spent+=b.stake;if(b.bet===b.actual)returned+=b.payout*b.stake/100}}$('tested').textContent=grouped.size;$('hit').textContent=(wins/grouped.size*100).toFixed(1)+'%';$('roi').textContent=(returned/spent*100).toFixed(1)+'%';$('backtestMsg').textContent=`投資 ${spent.toLocaleString()}円 / 払戻 ${returned.toLocaleString()}円。読み込んだ予測記録に対する集計です。`;}catch(err){$('backtestMsg').textContent='検証失敗: '+err.message}};
