@@ -16,24 +16,27 @@ async function getCSV(dataset,date){const [y,m,d]=date.split('-');const path=`${
 const safe=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function render(){let venue=venues[Number($('venue').value)-1];$('raceTitle').textContent=`${$('date').value} ${venue} ${$('race').value}R 出走表${isDemo?'（サンプル）':''}`;$('entries').innerHTML=entries.map(e=>`<tr><td><span class="lane ${e.lane>1?'lane'+e.lane:''}">${e.lane}</span></td><td>${safe(e.name)}</td><td>${safe(e.class)}</td><td>${fmt(e.national)}</td><td>${fmt(e.local)}</td><td>${fmt(e.motor)}%</td><td>${fmt(e.exhibition)}</td></tr>`).join('');$('dataNote').textContent=isDemo?'2026/11/7 住之江12Rの提供画像から作成した固定サンプル。現在の実データではありません。':'公開CSVから取得。欠損項目は—表示。';compute()}
 function fmt(x){return x==null?'—':Number(x).toFixed(2)}
+// Shared pre-race model: historical simulation uses only race-card fields (no post-race data).
+function probabilitiesFor(racers){
+ if(racers.length!==6)return [];
+ const strengths=racers.map(e=>{
+  const score=1+(e.national??6.5)*.16+(e.local??6.5)*.08+(e.motor??35)*.008+(e.exhibition==null?0:(6.85-e.exhibition)*1.5);
+  return Math.max(.2,score)*([1.65,1.10,1.03,.94,.77,.62][e.lane-1]);
+ });
+ const total=strengths.reduce((a,b)=>a+b,0),out=[];
+ for(let a=0;a<6;a++)for(let b=0;b<6;b++)for(let c=0;c<6;c++){
+  if(a===b||a===c||b===c)continue;
+  const p=strengths[a]/total*strengths[b]/(total-strengths[a])*strengths[c]/(total-strengths[a]-strengths[b]);
+  out.push({bet:`${a+1}-${b+1}-${c+1}`,p});
+ }
+ return out.sort((a,b)=>b.p-a.p);
+}
 function compute(){
  pred=[];
  if(entries.length!==6){$('predictions').innerHTML='';$('best').textContent='—';$('bestP').textContent='—';$('betSummary').textContent='';return}
  // Plackett-Luce style sequential ordering: P(a,b,c)=P(a)*P(b|a)*P(c|a,b).
  // Hand-tuned strengths, not fitted to historical outcomes; NOT calibrated probabilities.
- const strengths=entries.map(e=>{
-  let score=1+(e.national??6.5)*.16+(e.local??6.5)*.08+(e.motor??35)*.008+(e.exhibition==null?0:(6.85-e.exhibition)*1.5);
-  return Math.max(.2,score)*([1.65,1.10,1.03,.94,.77,.62][e.lane-1]);
- });
- const total=strengths.reduce((a,b)=>a+b,0);
- for(let a=0;a<6;a++)for(let b=0;b<6;b++)for(let c=0;c<6;c++){
-  if(a===b||a===c||b===c)continue;
-  const p=strengths[a]/total*strengths[b]/(total-strengths[a])*strengths[c]/(total-strengths[a]-strengths[b]);
-  const bet=`${a+1}-${b+1}-${c+1}`;
-  const odd=oddsMap[bet]||null;
-  pred.push({bet,p,odds:odd,ev:odd?p*odd:null});
- }
- pred.sort((a,b)=>b.p-a.p);
+ pred=probabilitiesFor(entries).map(item=>{const odd=oddsMap[item.bet]||null;return {...item,odds:odd,ev:odd?item.p*odd:null};});
  $('best').textContent=pred[0].bet;$('bestP').textContent=(pred[0].p*100).toFixed(2)+'%';renderBets();
 }
 function selectedBets(){
@@ -123,4 +126,76 @@ $('runBacktest').onclick=async()=>{
   message.className='success';
  }catch(err){message.textContent='検証失敗: '+err.message;message.className='error'}
  finally{$('runBacktest').disabled=false}
+};
+
+// Automatic retrospective simulation: obtains archived race cards and final payout data.
+$('autoVenue').add(new Option('全24場','all'));
+venues.forEach((name,i)=>$('autoVenue').add(new Option(`${pad(i+1)} ${name}`,pad(i+1))));
+$('autoVenue').value='12';
+const yesterday=new Date(Date.parse(jst+'T00:00:00Z')-86400000).toISOString().slice(0,10);
+$('autoEnd').value=yesterday;
+$('autoStart').value=new Date(Date.parse(yesterday+'T00:00:00Z')-6*86400000).toISOString().slice(0,10);
+const raceId=o=>String(val(o,['レースコード','race_code','race_id'])).trim();
+const datesBetween=(start,end)=>{
+ const a=Date.parse(start+'T00:00:00Z'),b=Date.parse(end+'T00:00:00Z');
+ if(!Number.isFinite(a)||!Number.isFinite(b)||b<a)throw Error('開始日・終了日を確認してください。');
+ const count=Math.round((b-a)/86400000)+1;
+ if(count>14)throw Error('一度に検証できるのは最大14日間です。');
+ if(b>=Date.parse(jst+'T00:00:00Z'))throw Error('結果確定済みの過去日を指定してください（本日以降は対象外）。');
+ return Array.from({length:count},(_,i)=>new Date(a+i*86400000).toISOString().slice(0,10));
+};
+const uniqueRaceId=id=>/^\d{12}$/.test(id)&&Number(id.slice(8,10))>=1&&Number(id.slice(8,10))<=24&&Number(id.slice(10,12))>=1&&Number(id.slice(10,12))<=12;
+$('runAuto').onclick=async()=>{
+ const button=$('runAuto'),msg=$('autoMsg');button.disabled=true;msg.className='muted';
+ $('autoRows').innerHTML='';for(const id of ['autoTested','autoHit','autoRoi','autoBrier'])$(id).textContent='—';
+ try{
+  const dates=datesBetween($('autoStart').value,$('autoEnd').value),venue=$('autoVenue').value;
+  const topN=Number($('autoTop').value),stake=Number($('autoStake').value);
+  if(!Number.isInteger(stake)||stake<100||stake%100)throw Error('購入額は100円以上・100円単位にしてください。');
+  let tested=0,wins=0,spent=0,returned=0,brier=0,logloss=0,skipped=0,missing=0;
+  const details=[];
+  for(let i=0;i<dates.length;i++){
+   const date=dates[i];msg.textContent=`${i+1}/${dates.length}日目 ${date} の出走表・払戻を取得中…`;
+   let cards,payouts;
+   try{[cards,payouts]=await Promise.all([getCSV('programs/race_cards',date),getCSV('results/payouts',date)]);}catch(err){missing++;continue}
+   // Results are optional as payout CSV itself contains the confirmed winning combination.
+   let results=null;
+   try{results=(await getCSV('results/realtime',date)).rows;}catch(e){}
+   const resultMap=new Map();
+   if(results)for(const row of results){const id=raceId(row);if(uniqueRaceId(id))resultMap.set(id,row)}
+   const seen=new Set();
+   for(const row of payouts.rows){
+    const id=raceId(row);if(!uniqueRaceId(id)||id.slice(0,8)!==date.replaceAll('-','')||(venue!=='all'&&id.slice(8,10)!==venue)||seen.has(id))continue;
+    seen.add(id);
+    const actual=String(val(row,['3連単_組番','３連単_組番','三連単_組番'])).trim();
+    const payoutRaw=String(val(row,['3連単_払戻金','３連単_払戻金','三連単_払戻金'])).replace(/[,，円\s]/g,'');
+    const payout=Number(payoutRaw);
+    if(!validBet(actual)||!payoutRaw||!Number.isFinite(payout)||payout<=0){skipped++;continue}
+    const resultRow=resultMap.get(id);
+    if(results&& !resultRow){skipped++;continue}
+    if(resultRow){
+     const finishing=[1,2,3].map(n=>String(val(resultRow,[`${n}着_艇番`])).trim()).join('-');
+     if(finishing!==actual){skipped++;continue}
+    }
+    const code=id.slice(8,10),r=Number(id.slice(10,12));
+    const racers=normalize(cards.rows,code,r,date);
+    if(racers.length!==6||racers.some(e=>!e.name||e.name==='未取得')){skipped++;continue}
+    const probabilities=probabilitiesFor(racers),correct=probabilities.find(p=>p.bet===actual);
+    if(!correct||probabilities.length!==120){skipped++;continue}
+    const selected=probabilities.slice(0,topN),hit=selected.some(p=>p.bet===actual);
+    tested++;if(hit)wins++;spent+=topN*stake;returned+=hit?payout*stake/100:0;
+    brier+=probabilities.reduce((sum,p)=>sum+(p.p-(p.bet===actual?1:0))**2,0);
+    logloss+=-Math.log(Math.max(correct.p,1e-15));
+    details.push({id,actual,hit,payout,correctP:correct.p,spent:topN*stake,returned:hit?payout*stake/100:0});
+   }
+  }
+  if(!tested)throw Error(`検証可能なレースがありません。取得できなかった日 ${missing}日、除外 ${skipped}レース。日付やCSV公開状況を確認してください。`);
+  $('autoTested').textContent=String(tested);
+  $('autoHit').textContent=(wins/tested*100).toFixed(1)+'%';
+  $('autoRoi').textContent=(returned/spent*100).toFixed(1)+'%';
+  $('autoBrier').textContent=(brier/tested).toFixed(4);
+  $('autoRows').innerHTML=details.map(d=>`<tr><td>${safe(d.id)}</td><td>${safe(d.actual)}</td><td>${d.hit?'的中':'不的中'}</td><td>${(d.correctP*100).toFixed(2)}%</td><td>${d.payout.toLocaleString()}円</td><td>${d.returned.toLocaleString()}円</td></tr>`).join('');
+  msg.textContent=`過去出走表だけで再計算した参考シミュレーション：${tested}レース、的中${wins}、投資${spent.toLocaleString()}円、払戻${returned.toLocaleString()}円。未取得日${missing}、除外${skipped}。対数損失 ${(logloss/tested).toFixed(4)}。展示タイムは使わず、実際に事前保存した予測の検証とは異なります。`;
+  msg.className='success';
+ }catch(err){msg.textContent='自動検証失敗: '+err.message;msg.className='error'}finally{button.disabled=false}
 };
