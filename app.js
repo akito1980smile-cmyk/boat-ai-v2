@@ -295,38 +295,78 @@ function parseConcept37(r,file,line){
  }
  return v;
 }
+// v3.8: all import methods use the same validated, atomic merge path.
+const conceptStoreKey='boat-ai-v3.8-concept-rows';
+function saveConceptLocal(){
+ try{localStorage.setItem(conceptStoreKey,JSON.stringify(conceptRows));$('conceptStorageStatus').textContent=`ブラウザに自動保存済み：${conceptRows.length}行。バックアップは「統合CSVを保存」をご利用ください。`}
+ catch(e){$('conceptStorageStatus').textContent='ブラウザへの自動保存に失敗しました。統合CSVを保存してください：'+e.message}
+}
+function importConceptTexts(sources){
+ const incoming=[];
+ for(const {name,text} of sources){
+  const rows=objects(text.replace(/^\uFEFF/,''));
+  if(!rows.length||!['date','venue','race','lane'].every(k=>Object.hasOwn(rows[0],k)))throw Error(`${name}：date,venue,race,lane 列とデータ行が必要です`);
+  rows.forEach((r,i)=>incoming.push(parseConcept37(r,name,i+2)));
+ }
+ const merged=new Map(conceptRows.map(r=>[conceptKey37(r),r]));let duplicates=0;
+ for(const r of incoming){const k=conceptKey37(r);if(merged.has(k))duplicates++;merged.set(k,r)}
+ conceptRows=[...merged.values()].sort((a,b)=>conceptKey37(a).localeCompare(conceptKey37(b)));
+ conceptEnabled=true;$('conceptToggle').checked=true;
+ updateConceptInventory();applyConcept();compute();saveConceptLocal();
+ $('conceptImportStatus').textContent=`追加 ${sources.length}件・${incoming.length}行 / 重複 ${duplicates}行（後読み優先）/ 統合 ${conceptRows.length}行。`;
+ $('conceptImportStatus').className='success';
+}
+async function importConceptFiles(files){
+ if(!files.length)return;
+ try{const sources=await Promise.all(files.map(async f=>({name:f.name,text:await f.text()})));importConceptTexts(sources)}
+ catch(err){$('conceptImportStatus').textContent='読み込み失敗（既存データは保持）：'+err.message;$('conceptImportStatus').className='error'}
+}
 $('conceptFile').addEventListener('change',async event=>{
- const files=[...event.target.files];if(!files.length)return;
- try{
-  const incoming=[];
-  for(const file of files){
-   const rows=objects((await file.text()).replace(/^\uFEFF/,''));
-   if(!rows.length||!['date','venue','race','lane'].every(k=>Object.hasOwn(rows[0],k)))throw Error(`${file.name}：date,venue,race,lane 列とデータ行が必要です`);
-   rows.forEach((r,i)=>incoming.push(parseConcept37(r,file.name,i+2)));
-  }
-  const merged=new Map(conceptRows.map(r=>[conceptKey37(r),r]));let duplicates=0;
-  for(const r of incoming){const k=conceptKey37(r);if(merged.has(k))duplicates++;merged.set(k,r)}
-  conceptRows=[...merged.values()].sort((a,b)=>conceptKey37(a).localeCompare(conceptKey37(b)));
-  conceptEnabled=true;$('conceptToggle').checked=true;
-  updateConceptInventory();applyConcept();compute();
-  $('conceptImportStatus').textContent=`追加 ${files.length}ファイル・${incoming.length}行 / 重複 ${duplicates}行（後読み優先）/ 統合 ${conceptRows.length}行。既存登録分も保持しました。`;
-  $('conceptImportStatus').className=duplicates?'muted':'success';
- }catch(err){$('conceptImportStatus').textContent='読み込み失敗（既存データは保持）：'+err.message;$('conceptImportStatus').className='error'}
- finally{event.target.value=''}
+ await importConceptFiles([...event.target.files]);event.target.value='';
 });
+$('conceptPasteAdd').addEventListener('click',()=>{
+ try{importConceptTexts([{name:'貼り付けCSV',text:$('conceptPaste').value}]);$('conceptPaste').value=''}
+ catch(err){$('conceptImportStatus').textContent='貼り付け失敗（既存データは保持）：'+err.message;$('conceptImportStatus').className='error'}
+});
+const drop=$('conceptDrop');
+for(const name of ['dragenter','dragover'])drop.addEventListener(name,e=>{e.preventDefault();drop.style.background='#304d77'});
+for(const name of ['dragleave','drop'])drop.addEventListener(name,e=>{e.preventDefault();drop.style.background=''});
+drop.addEventListener('drop',e=>importConceptFiles([...e.dataTransfer.files].filter(f=>/\.csv$/i.test(f.name))));
+for(let r=1;r<=12;r++)for(const id of ['conceptFrom','conceptTo'])$(id).add(new Option(`${r}R`,r));
+$('conceptFrom').value='1';$('conceptTo').value='12';
+function downloadConceptCSV(csv,filename){
+ const url=URL.createObjectURL(new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'}));
+ const a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+$('conceptTemplate').addEventListener('click',()=>{
+ const first=Number($('conceptFrom').value),last=Number($('conceptTo').value);
+ if(first>last){$('conceptImportStatus').textContent='開始Rは終了R以下にしてください。';$('conceptImportStatus').className='error';return}
+ const date=$('date').value,venue=pad(Number($('venue').value)),rows=['date,venue,race,lane,win1,escape2,makuri,sashi'];
+ for(let race=first;race<=last;race++)for(let lane=1;lane<=6;lane++)rows.push(`${date},${venue},${race},${lane},,,,`);
+ downloadConceptCSV(rows.join('\r\n'),`concept-template-${date}-${venue}-${first}R-${last}R.csv`);
+ $('conceptImportStatus').textContent=`入力用テンプレートを保存：${last-first+1}レース・${(last-first+1)*6}行。数値を入力してから読み込んでください。`;
+ $('conceptImportStatus').className='muted';
+});
+function restoreConceptLocal(){
+ try{
+  const raw=localStorage.getItem(conceptStoreKey);if(!raw)return;
+  const parsed=JSON.parse(raw);if(!Array.isArray(parsed))throw Error('保存形式が不正です');
+  const rows=parsed.map((r,i)=>parseConcept37(r,'ブラウザ保存',i+1));
+  const unique=new Map(rows.map(r=>[conceptKey37(r),r]));conceptRows=[...unique.values()];
+  if(conceptRows.length){conceptEnabled=true;$('conceptToggle').checked=true;updateConceptInventory();applyConcept();$('conceptImportStatus').textContent=`ブラウザ保存から${conceptRows.length}行を復元しました。`;$('conceptImportStatus').className='success'}
+ }catch(e){$('conceptStorageStatus').textContent='保存データを復元できません：'+e.message}
+}
 $('conceptClear').addEventListener('click',()=>{
  if(!confirm('登録した新概念データをすべてクリアしますか？'))return;
  conceptRows=[];conceptEnabled=false;$('conceptToggle').checked=false;
- updateConceptInventory();applyConcept();compute();
+ updateConceptInventory();applyConcept();compute();saveConceptLocal();
  $('conceptImportStatus').textContent='登録データをクリアしました。';$('conceptImportStatus').className='muted';
 });
 $('conceptExport').addEventListener('click',()=>{
  const cols=['date','venue','race','lane','win1','escape2','makuri','sashi'];
- const csv='\uFEFF'+[cols.join(','),...conceptRows.map(r=>cols.map(k=>r[k]??'').join(','))].join('\r\n');
- const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
- const a=document.createElement('a');a.href=url;a.download='boat-ai-v3.7-concept-merged.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ downloadConceptCSV([cols.join(','),...conceptRows.map(r=>cols.map(k=>r[k]??'').join(','))].join('\r\n'),'boat-ai-v3.8-concept-merged.csv');
 });
-updateConceptInventory();
+updateConceptInventory();restoreConceptLocal();
 $('conceptToggle').addEventListener('change',event=>{conceptEnabled=event.target.checked;compute()});
 
 
