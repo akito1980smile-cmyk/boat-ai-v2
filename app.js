@@ -5,6 +5,7 @@ const jst=new Date(Date.now()+9*3600000).toISOString().slice(0,10);$('date').val
 venues.forEach((v,i)=>$('venue').add(new Option(`${pad(i+1)} ${v}`,pad(i+1))));$('venue').value='12';for(let r=1;r<=12;r++)$('race').add(new Option(`${r}R`,r));$('race').value='12';
 let entries=[],pred=[],isDemo=false,oddsMap={};
 let conceptRows=[],conceptEnabled=false;
+let venueStats=new Map(),venueStatsEnabled=false;
 const sample=[['松井繁',6.99,7.31,42.75,6.77],['村上遼',6.69,5.33,45.38,6.79],['池田浩二',7.72,8,35.66,6.78],['久田敏之',7.88,7.59,33.58,6.84],['山田哲也',6.57,5.25,39.2,6.89],['石本裕武',6.67,6.44,31.06,6.73]].map((a,i)=>({lane:i+1,name:a[0],class:'A1',national:a[1],local:a[2],motor:a[3],exhibition:a[4]}));
 function csvParse(text){let rows=[],row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){let c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++}else quoted=!quoted}else if(c===','&&!quoted){row.push(cell);cell=''}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(cell);if(row.some(x=>x.trim()))rows.push(row);row=[];cell=''}else cell+=c}row.push(cell);if(row.some(x=>x.trim()))rows.push(row);return rows}
 function objects(csv){let rows=csvParse(csv.replace(/^\ufeff/,''));if(!rows.length)return [];let h=rows.shift();return rows.map(r=>Object.fromEntries(h.map((k,i)=>[k.trim(),(r[i]||'').trim()])))}
@@ -18,7 +19,7 @@ const safe=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>
 function render(){let venue=venues[Number($('venue').value)-1];$('raceTitle').textContent=`${$('date').value} ${venue} ${$('race').value}R 出走表${isDemo?'（サンプル）':''}`;$('entries').innerHTML=entries.map(e=>`<tr><td><span class="lane ${e.lane>1?'lane'+e.lane:''}">${e.lane}</span></td><td>${safe(e.name)}</td><td>${safe(e.class)}</td><td>${fmt(e.national)}</td><td>${fmt(e.local)}</td><td>${fmt(e.motor)}%</td><td>${fmt(e.exhibition)}</td></tr>`).join('');$('dataNote').textContent=isDemo?'2026/11/7 住之江12Rの提供画像から作成した固定サンプル。現在の実データではありません。':'公開CSVから取得。欠損項目は—表示。';applyConcept();compute()}
 function fmt(x){return x==null?'—':Number(x).toFixed(2)}
 // Shared pre-race model: historical simulation uses only race-card fields (no post-race data).
-function probabilitiesFor(racers, useConcept=true){
+function probabilitiesFor(racers, useConcept=true, useVenueStats=false){
  if(racers.length!==6)return [];
  const strengths=racers.map(e=>{
   const score=1+(e.national??6.5)*.16+(e.local??6.5)*.08+(e.motor??35)*.008+(e.exhibition==null?0:(6.85-e.exhibition)*1.5);
@@ -33,6 +34,18 @@ function probabilitiesFor(racers, useConcept=true){
   }
   return Math.max(.2,score)*([1.65,1.10,1.03,.94,.77,.62][e.lane-1])*factor;
  });
+ if(useVenueStats && venueStatsEnabled){
+  const code=$('venue').value, stats=venueStats.get(code);
+  if(stats && stats.rates.length===6){
+   // Prior regularization: mild, bounded adjustment, not a calibrated probability model.
+   const reference=[.55,.14,.13,.10,.055,.025];
+   strengths.forEach((_,i)=>{
+    const observed=stats.rates[i]/100;
+    const multiplier=Math.max(.85,Math.min(1.15,Math.pow((observed+.02)/(reference[i]+.02),.18)));
+    strengths[i]*=multiplier;
+   });
+  }
+ }
  const total=strengths.reduce((a,b)=>a+b,0),out=[];
  for(let a=0;a<6;a++)for(let b=0;b<6;b++)for(let c=0;c<6;c++){
   if(a===b||a===c||b===c)continue;
@@ -46,7 +59,7 @@ function compute(){
  if(entries.length!==6){$('predictions').innerHTML='';$('best').textContent='—';$('bestP').textContent='—';$('betSummary').textContent='';return}
  // Plackett-Luce style sequential ordering: P(a,b,c)=P(a)*P(b|a)*P(c|a,b).
  // Hand-tuned strengths, not fitted to historical outcomes; NOT calibrated probabilities.
- pred=probabilitiesFor(entries,conceptEnabled).map(item=>{const odd=oddsMap[item.bet]||null;return {...item,odds:odd,ev:odd?item.p*odd:null};});
+ pred=probabilitiesFor(entries,conceptEnabled,true).map(item=>{const odd=oddsMap[item.bet]||null;return {...item,odds:odd,ev:odd?item.p*odd:null};});
  $('best').textContent=pred[0].bet;$('bestP').textContent=(pred[0].p*100).toFixed(2)+'%';renderBets();
 }
 function selectedBets(){
@@ -453,3 +466,44 @@ $('pairRun').onclick=async()=>{
   msg.className='success';
  }catch(e){msg.textContent='比較検証：'+e.message;msg.className='error'}finally{button.disabled=false}
 };
+
+// v3.9: User-supplied venue statistics, isolated from historical simulations.
+const venueAliases={'びわこ':'びわこ','琵琶湖':'びわこ','からつ':'唐津','唐津':'唐津','まるがめ':'丸亀','丸亀':'丸亀','住之江':'住之江'};
+function venueCodeFromName(name){
+ const v=String(name||'').trim().replace(/^\d{1,2}\s*/, '').replace(/競艇場|ボートレース|BOATRACE/g,'').trim();
+ if(/^\d{1,2}$/.test(v)){const n=Number(v);return n>=1&&n<=24?pad(n):null}
+ const index=venues.indexOf(venueAliases[v]||v);return index<0?null:pad(index+1);
+}
+function refreshVenueStats(){
+ const code=$('venue').value, stats=venueStats.get(code);
+ $('venueStatsCount').textContent=String(venueStats.size);
+ $('venueStatsCurrent').textContent=stats?`${venues[Number(code)-1]}（${stats.period}）`:`${venues[Number(code)-1]}：未登録`;
+ $('venueStatsStatus').textContent=`登録 ${venueStats.size}/24場・補正 ${venueStatsEnabled?'ON':'OFF'}。${stats?(stats.rates.length===6?'6コース補正可能':'1コースのみ：補正対象外'):'現在の場は未登録'}。過去検証には適用されません。`;
+ $('venueStatsRows').innerHTML=Array.from({length:6},(_,i)=>{
+  const pct=stats?.rates[i], ref=[.55,.14,.13,.10,.055,.025][i];
+  const factor=pct==null?null:Math.max(.85,Math.min(1.15,Math.pow((pct/100+.02)/(ref+.02),.18)));
+  return `<tr><td>${i+1}コース</td><td>${pct==null?'—':pct.toFixed(1)+'%'}</td><td>${factor==null||stats.rates.length!==6?'—':factor.toFixed(3)+'倍'}</td></tr>`;
+ }).join('');
+}
+$('venueStatsFile').addEventListener('change',async event=>{
+ let imported=0, rejected=0, invalid=0;
+ for(const file of event.target.files){
+  try{
+   const rows=objects(await file.text());
+   for(const r of rows){
+    const code=venueCodeFromName(r.venue);if(!code){rejected++;continue}
+    let rates=Array.from({length:6},(_,i)=>number(r[`course${i+1}_pct`]));
+    if(rates.every(x=>x==null)&&r.first_course_win_pct!=null)rates=[number(r.first_course_win_pct)];
+    if(!(rates.length===6&&rates.every(x=>x!=null&&x>=0&&x<=100)) && !(rates.length===1&&rates[0]!=null&&rates[0]>=0&&rates[0]<=100)){invalid++;continue}
+    venueStats.set(code,{rates,period:r.period_label||r.year||'期間未指定'});imported++;
+   }
+  }catch(e){invalid++}
+ }
+ refreshVenueStats();compute();
+ $('venueStatsStatus').textContent+=` 今回追加 ${imported}行、場名不明 ${rejected}行、不正 ${invalid}行。`;
+ event.target.value='';
+});
+$('venueStatsToggle').addEventListener('change',e=>{venueStatsEnabled=e.target.checked;refreshVenueStats();compute()});
+$('venueStatsClear').addEventListener('click',()=>{venueStats.clear();venueStatsEnabled=false;$('venueStatsToggle').checked=false;refreshVenueStats();compute()});
+$('venue').addEventListener('change',refreshVenueStats);
+refreshVenueStats();
